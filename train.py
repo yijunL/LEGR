@@ -1,18 +1,18 @@
-import argparse
 import os
-
+os.environ["CUDA_VISIBLE_DEVICES"]='5'
+import argparse
 import numpy as np
 import torch
 from apex import amp
 import ujson as json
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModel, AutoTokenizer
-from transformers.optimization import AdamW, get_linear_schedule_with_warmup
+from transformers.optimization import AdamW, get_polynomial_decay_schedule_with_warmup
 from model import DocREModel
 from utils import set_seed, collate_fn
 from prepro import read_docred
 from evaluation import to_official, official_evaluate
-import wandb
+from tqdm import tqdm
 
 
 def train(args, model, train_features, dev_features, test_features):
@@ -22,18 +22,20 @@ def train(args, model, train_features, dev_features, test_features):
         train_iterator = range(int(num_epoch))
         total_steps = int(len(train_dataloader) * num_epoch // args.gradient_accumulation_steps)
         warmup_steps = int(total_steps * args.warmup_ratio)
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+        scheduler = get_polynomial_decay_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps,power=3)
         print("Total steps: {}".format(total_steps))
         print("Warmup steps: {}".format(warmup_steps))
         for epoch in train_iterator:
             model.zero_grad()
-            for step, batch in enumerate(train_dataloader):
+            for step, batch in tqdm(enumerate(train_dataloader),total=len(train_dataloader),desc='Training'):
                 model.train()
                 inputs = {'input_ids': batch[0].to(args.device),
                           'attention_mask': batch[1].to(args.device),
                           'labels': batch[2],
                           'entity_pos': batch[3],
                           'hts': batch[4],
+                          'entity_graphs': batch[5],
+                          'path_table': batch[6]
                           }
                 outputs = model(**inputs)
                 loss = outputs[0] / args.gradient_accumulation_steps
@@ -46,28 +48,27 @@ def train(args, model, train_features, dev_features, test_features):
                     scheduler.step()
                     model.zero_grad()
                     num_steps += 1
-                wandb.log({"loss": loss.item()}, step=num_steps)
                 if (step + 1) == len(train_dataloader) - 1 or (args.evaluation_steps > 0 and num_steps % args.evaluation_steps == 0 and step % args.gradient_accumulation_steps == 0):
                     dev_score, dev_output = evaluate(args, model, dev_features, tag="dev")
-                    wandb.log(dev_output, step=num_steps)
-                    print(dev_output)
+                    print("Epoch: ",epoch,"  ",dev_output)
+
                     if dev_score > best_score:
                         best_score = dev_score
-                        pred = report(args, model, test_features)
-                        with open("result.json", "w") as fh:
-                            json.dump(pred, fh)
+#                         pred = report(args, model, test_features)
+#                         with open("result_"+str(dev_score)+".json", "w") as fh:
+#                             json.dump(pred, fh)
                         if args.save_path != "":
                             torch.save(model.state_dict(), args.save_path)
         return num_steps
 
-    new_layer = ["extractor", "bilinear"]
+    new_layer = ["extractor", "bilinear", "edge_layer", "path_info_attention", "path_info_mapping"]
     optimizer_grouped_parameters = [
         {"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in new_layer)], },
         {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in new_layer)], "lr": 1e-4},
     ]
 
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    model, optimizer = amp.initialize(model, optimizer, opt_level="O1", verbosity=0)
+    model, optimizer = amp.initialize(model, optimizer, opt_level="O0", verbosity=0)
     num_steps = 0
     set_seed(args)
     model.zero_grad()
@@ -78,13 +79,15 @@ def evaluate(args, model, features, tag="dev"):
 
     dataloader = DataLoader(features, batch_size=args.test_batch_size, shuffle=False, collate_fn=collate_fn, drop_last=False)
     preds = []
-    for batch in dataloader:
+    for batch in tqdm(dataloader, total=len(dataloader), desc='Evaluating'):
         model.eval()
 
         inputs = {'input_ids': batch[0].to(args.device),
                   'attention_mask': batch[1].to(args.device),
                   'entity_pos': batch[3],
                   'hts': batch[4],
+                  'entity_graphs': batch[5],
+                  'path_table': batch[6]
                   }
 
         with torch.no_grad():
@@ -115,6 +118,8 @@ def report(args, model, features):
                   'attention_mask': batch[1].to(args.device),
                   'entity_pos': batch[3],
                   'hts': batch[4],
+                  'entity_graphs': batch[5],
+                  'path_table': batch[6]
                   }
 
         with torch.no_grad():
@@ -132,13 +137,15 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--data_dir", default="./dataset/docred", type=str)
-    parser.add_argument("--transformer_type", default="bert", type=str)
-    parser.add_argument("--model_name_or_path", default="bert-base-cased", type=str)
+#     parser.add_argument("--transformer_type", default="bert", type=str)
+    parser.add_argument("--transformer_type", default="roberta", type=str)
+#     parser.add_argument("--model_name_or_path", default="bert-base-cased", type=str)
+    parser.add_argument("--model_name_or_path", default="roberta-large", type=str)
 
     parser.add_argument("--train_file", default="train_annotated.json", type=str)
     parser.add_argument("--dev_file", default="dev.json", type=str)
     parser.add_argument("--test_file", default="test.json", type=str)
-    parser.add_argument("--save_path", default="", type=str)
+    parser.add_argument("--save_path", default="models/best_model.pth", type=str)
     parser.add_argument("--load_path", default="", type=str)
 
     parser.add_argument("--config_name", default="", type=str,
@@ -149,15 +156,15 @@ def main():
                         help="The maximum total input sequence length after tokenization. Sequences longer "
                              "than this will be truncated, sequences shorter will be padded.")
 
-    parser.add_argument("--train_batch_size", default=4, type=int,
+    parser.add_argument("--train_batch_size", default=3, type=int,
                         help="Batch size for training.")
-    parser.add_argument("--test_batch_size", default=8, type=int,
+    parser.add_argument("--test_batch_size", default=6, type=int,
                         help="Batch size for testing.")
     parser.add_argument("--gradient_accumulation_steps", default=1, type=int,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
-    parser.add_argument("--num_labels", default=4, type=int,
+    parser.add_argument("--num_labels", default=3, type=int,
                         help="Max number of labels in prediction.")
-    parser.add_argument("--learning_rate", default=5e-5, type=float,
+    parser.add_argument("--learning_rate", default=5e-6, type=float,
                         help="The initial learning rate for Adam.")
     parser.add_argument("--adam_epsilon", default=1e-6, type=float,
                         help="Epsilon for Adam optimizer.")
@@ -165,7 +172,7 @@ def main():
                         help="Max gradient norm.")
     parser.add_argument("--warmup_ratio", default=0.06, type=float,
                         help="Warm up ratio for Adam.")
-    parser.add_argument("--num_train_epochs", default=30.0, type=float,
+    parser.add_argument("--num_train_epochs", default=20.0, type=float,
                         help="Total number of training epochs to perform.")
     parser.add_argument("--evaluation_steps", default=-1, type=int,
                         help="Number of training steps between evaluations.")
@@ -175,7 +182,6 @@ def main():
                         help="Number of relation types in dataset.")
 
     args = parser.parse_args()
-    wandb.init(project="DocRED")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
@@ -215,7 +221,7 @@ def main():
     if args.load_path == "":  # Training
         train(args, model, train_features, dev_features, test_features)
     else:  # Testing
-        model = amp.initialize(model, opt_level="O1", verbosity=0)
+        model = amp.initialize(model, opt_level="O0", verbosity=0)
         model.load_state_dict(torch.load(args.load_path))
         dev_score, dev_output = evaluate(args, model, dev_features, tag="dev")
         print(dev_output)

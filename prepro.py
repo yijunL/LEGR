@@ -1,5 +1,8 @@
 from tqdm import tqdm
 import ujson as json
+import dgl
+import numpy as np
+from collections import defaultdict
 
 docred_rel2id = json.load(open('meta/rel2id.json', 'r'))
 cdr_rel2id = {'1:NR:2': 0, '1:CID:2': 1}
@@ -24,9 +27,11 @@ def read_docred(file_in, tokenizer, max_seq_length=1024):
     with open(file_in, "r") as fh:
         data = json.load(fh)
 
-    for sample in tqdm(data, desc="Example"):
+    for sample in tqdm(data, desc="Example",ncols=80):
         sents = []
         sent_map = []
+        per_pos_samples=0
+        per_neg_samples=0
 
         entities = sample['vertexSet']
         entity_start, entity_end = [], []
@@ -48,7 +53,11 @@ def read_docred(file_in, tokenizer, max_seq_length=1024):
                 sents.extend(tokens_wordpiece)
             new_map[i_t + 1] = len(sents)
             sent_map.append(new_map)
-
+        
+        Ls=[0]
+        for mp in sent_map:
+            Ls.append(mp[max(mp)])
+           
         train_triple = {}
         if "labels" in sample:
             for label in sample['labels']:
@@ -78,6 +87,7 @@ def read_docred(file_in, tokenizer, max_seq_length=1024):
             relations.append(relation)
             hts.append([h, t])
             pos_samples += 1
+            per_pos_samples+=1
 
         for h in range(len(entities)):
             for t in range(len(entities)):
@@ -86,8 +96,22 @@ def read_docred(file_in, tokenizer, max_seq_length=1024):
                     relations.append(relation)
                     hts.append([h, t])
                     neg_samples += 1
+                    per_neg_samples+=1
 
         assert len(relations) == len(entities) * (len(entities) - 1)
+
+        pos_id = np.zeros((max_seq_length,), dtype=np.int32)
+        already_exist = set()  # dealing with NER overlapping problem
+
+        for idx, e in enumerate(entities, 1):
+            for idm, m in enumerate(e):
+                pos0, pos1 = entity_pos[idx-1][idm]
+                if (pos0, pos1) in already_exist:
+                    continue
+                pos_id[pos0:pos1] = idx
+                already_exist.add((pos0, pos1))
+
+        entity_graph, path = create_entity_graph(Ls, pos_id)
 
         sents = sents[:max_seq_length - 2]
         input_ids = tokenizer.convert_tokens_to_ids(sents)
@@ -99,6 +123,10 @@ def read_docred(file_in, tokenizer, max_seq_length=1024):
                    'labels': relations,
                    'hts': hts,
                    'title': sample['title'],
+                   'pos_samples': per_pos_samples,
+                   'neg_samples': per_neg_samples,
+                   'entity_graph': entity_graph,
+                   'path': path
                    }
         features.append(feature)
 
@@ -114,7 +142,7 @@ def read_cdr(file_in, tokenizer, max_seq_length=1024):
     maxlen = 0
     with open(file_in, 'r') as infile:
         lines = infile.readlines()
-        for i_l, line in enumerate(tqdm(lines)):
+        for i_l, line in enumerate(tqdm(lines),ncols=80):
             line = line.rstrip().split('\t')
             pmid = line[0]
 
@@ -328,3 +356,39 @@ def read_gda(file_in, tokenizer, max_seq_length=1024):
     print("Number of documents: {}.".format(len(features)))
     print("Max document length: {}.".format(maxlen))
     return features
+
+def create_entity_graph(Ls, entity_id):
+
+    graph = dgl.DGLGraph()
+    graph.add_nodes(entity_id.max())
+
+    d = defaultdict(set)
+
+    #出现在同一句子中的entity
+    for i in range(1, len(Ls)):
+        tmp = set()
+        for j in range(Ls[i - 1], Ls[i]):
+            if entity_id[j] != 0:
+                tmp.add(entity_id[j])
+        tmp = list(tmp)
+        for ii in range(len(tmp)):
+            for jj in range(ii + 1, len(tmp)):
+                d[tmp[ii] - 1].add(tmp[jj] - 1)
+                d[tmp[jj] - 1].add(tmp[ii] - 1)
+    a = []
+    b = []
+    for k, v in d.items():
+        for vv in v:
+            a.append(k)
+            b.append(vv)
+    graph.add_edges(a, b)
+
+    path = dict()
+    for i in range(0, graph.number_of_nodes()):
+        for j in range(i + 1, graph.number_of_nodes()):
+            a = set(graph.successors(i).numpy())
+            b = set(graph.successors(j).numpy())
+            c = [val for val in list(a & b)]
+            path[(i, j)] = c
+    graph = dgl.add_self_loop(graph)
+    return graph, path
