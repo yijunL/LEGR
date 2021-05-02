@@ -16,7 +16,7 @@
 ## Dataset
 We use DocRED dataset to train an evaluate our model.  The [DocRED](https://www.aclweb.org/anthology/P19-1074/) dataset can be downloaded following the instructions at [link](https://github.com/thunlp/DocRED/tree/master/data).
 
-Data sets should be placed as follows:  
+Dataset should be placed as follows:  
 ```
 LEGR
  |-- dataset
