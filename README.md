@@ -30,7 +30,7 @@ LEGR
 ```
 
 ## Training and Evaluation
-Run train.py to train the model.  
-You can also change the `--model_name_or_path` argument to change the pretrained model (BERT-base or RoBERTa-large).  
-You can save the model by setting the `--save_path` argument before training. The model correponds to the best dev results will be saved.  
-Set the `--load_path` argument as the save path of the model and run train.py again to evaluate the model and produce the result.json that you can submit to the Codalab for the evaluation in the test dataset.
+* Run train.py to train the model.  
+* You can also change the `--model_name_or_path` argument to change the pretrained model (BERT-base or RoBERTa-large).  
+* You can save the model by setting the `--save_path` argument before training. The model correponds to the best dev results will be saved.  
+* Set the `--load_path` argument as the save path of the model and run train.py again to evaluate the model and produce the result.json that you can submit to the Codalab for the evaluation in the test dataset.
